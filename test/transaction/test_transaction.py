@@ -298,6 +298,15 @@ class TestTransaction:
             assert exc_info.value.dev_id == request.dev_id
             assert exc_info.value.transaction_id == request.transaction_id
 
+    async def _await_true(self, predicate, timeout=0.5) -> None:
+        """Yield until predicate is true or timeout."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not predicate():
+            if loop.time() >= deadline:
+                raise TimeoutError
+            await asyncio.sleep(0)
+
     async def test_execute_cancel_does_not_return_stale_registers(self, use_clc):
         """Cancelled execute must not deliver its response to the next request (#3070)."""
         transact = TransactionManager(
@@ -314,6 +323,7 @@ class TestTransaction:
         transact.connection_made(mock.AsyncMock())
         transact.transport.write = mock.Mock()  # type: ignore[method-assign, attr-defined]
         transact.comm_params.timeout_connect = 0.3
+        write = transact.transport.write  # type: ignore[attr-defined]
 
         stale_req = ReadHoldingRegistersRequest(address=0x3014, count=4, dev_id=1)
         next_req = ReadHoldingRegistersRequest(address=0x3014, count=5, dev_id=1)
@@ -327,7 +337,7 @@ class TestTransaction:
         next_frame = transact.framer.buildFrame(next_pdu)
 
         first = asyncio.create_task(transact.execute(False, stale_req))
-        await asyncio.sleep(0)
+        await self._await_true(lambda: write.call_count >= 1)
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
             await first
@@ -335,7 +345,7 @@ class TestTransaction:
         second = asyncio.create_task(transact.execute(False, next_req))
         await asyncio.sleep(0)
         transact.data_received(stale_frame)
-        await asyncio.sleep(0)
+        await self._await_true(lambda: write.call_count >= 2)
         transact.data_received(next_frame)
         result = await second
         assert result.registers == next_pdu.registers
@@ -357,6 +367,7 @@ class TestTransaction:
         transact.connection_made(mock.AsyncMock())
         transact.transport.write = mock.Mock()  # type: ignore[method-assign, attr-defined]
         transact.comm_params.timeout_connect = 0.05
+        write = transact.transport.write  # type: ignore[attr-defined]
 
         stale_req = ReadHoldingRegistersRequest(address=0x3014, count=4, dev_id=1)
         next_req = ReadHoldingRegistersRequest(address=0x3014, count=5, dev_id=1)
@@ -364,13 +375,13 @@ class TestTransaction:
         next_frame = transact.framer.buildFrame(next_pdu)
 
         first = asyncio.create_task(transact.execute(False, stale_req))
-        await asyncio.sleep(0)
+        await self._await_true(lambda: write.call_count >= 1)
         first.cancel()
         with pytest.raises(asyncio.CancelledError):
             await first
 
         second = asyncio.create_task(transact.execute(False, next_req))
-        await asyncio.sleep(0.08)
+        await self._await_true(lambda: write.call_count >= 2, timeout=0.5)
         transact.data_received(next_frame)
         result = await second
         assert result.registers == next_pdu.registers
