@@ -67,6 +67,7 @@ class TransactionManager(ModbusProtocol):  # pylint: disable=too-many-instance-a
             self.response_future: asyncio.Future = asyncio.Future()
             self.last_pdu: ModbusPDU | None = None
             self.last_addr: tuple | None = None
+            self._need_discard = False
 
     def dummy_trace_packet(self, sending: bool, data: bytes) -> bytes:
         """Do dummy trace."""
@@ -186,8 +187,8 @@ class TransactionManager(ModbusProtocol):  # pylint: disable=too-many-instance-a
     ) -> ModbusPDU:
         """Execute requests asynchronously.
 
-        REMARK: this method is identical to sync_execute, apart from the lock and try/except.
-                any changes in either method MUST be mirrored !!!
+        REMARK: _execute_with_retries is identical to sync_execute, apart from the lock
+                and cancellation cleanup. Any changes in either method MUST be mirrored !!!
         """
         if not self.transport:
             Log.warning("Not connected, trying to connect!")
@@ -196,47 +197,74 @@ class TransactionManager(ModbusProtocol):  # pylint: disable=too-many-instance-a
                     "Client cannot connect (automatic retry continuing) !!"
                 )
         async with self._lock:
-            request.transaction_id = self.getNextTID()
-            count_retries = 0
-            while count_retries <= self.retries:
-                self.recv_buffer = b""
+            try:
+                await self._discard_cancelled_response()
+                return await self._execute_with_retries(no_response_expected, request)
+            except asyncio.CancelledError:
+                # Keep a waiter so a late PDU cannot satisfy the next request.
                 self.response_future = asyncio.Future()
-                self.pdu_send(request)
-                if no_response_expected:
-                    return None  # type: ignore[return-value]
-                try:
-                    response: ModbusPDU = await asyncio.wait_for(
-                        self.response_future, timeout=self.comm_params.timeout_connect
-                    )
-                    self.count_until_disconnect = self.max_until_disconnect
-                    if request.dev_id and response.dev_id != request.dev_id:
-                        raise self._io_exception_from_request(
-                            f"ERROR: request uses device id={request.dev_id} but received {response.dev_id}.",
-                            request,
-                        )
-                    if (
-                        response.transaction_id
-                        and response.transaction_id != request.transaction_id
-                    ):
-                        raise self._io_exception_from_request(
-                            f"ERROR: request uses transaction id={request.transaction_id} but received {response.transaction_id}.",
-                            request,
-                        )
-                    response.retries = count_retries
-                    return response
-                except asyncio.exceptions.TimeoutError:
-                    count_retries += 1
-            if self.count_until_disconnect < 0:
-                if self.comm_params.comm_type != CommType.SERIAL:
-                    self.connection_lost(asyncio.TimeoutError("Server not responding"))
-                raise self._io_exception_from_request(
-                    "ERROR: No response received of the last requests (default: retries+3), CLOSING CONNECTION.",
-                    request,
+                self._need_discard = True
+                raise
+
+    async def _discard_cancelled_response(self) -> None:
+        """Absorb a response belonging to a previously cancelled request."""
+        if not self._need_discard:
+            return
+        self._need_discard = False
+        try:
+            await asyncio.wait_for(
+                self.response_future, timeout=self.comm_params.timeout_connect
+            )
+        except asyncio.exceptions.TimeoutError:
+            Log.debug("cancelled request, in-flight response timed out")
+        finally:
+            self.recv_buffer = b""
+
+    async def _execute_with_retries(
+        self, no_response_expected: bool, request: ModbusPDU
+    ) -> ModbusPDU:
+        """Send request and wait for a matching response, retrying on timeout."""
+        request.transaction_id = self.getNextTID()
+        count_retries = 0
+        while count_retries <= self.retries:
+            self.recv_buffer = b""
+            self.response_future = asyncio.Future()
+            self.pdu_send(request)
+            if no_response_expected:
+                return None  # type: ignore[return-value]
+            try:
+                response: ModbusPDU = await asyncio.wait_for(
+                    self.response_future, timeout=self.comm_params.timeout_connect
                 )
-            self.count_until_disconnect -= 1
-            txt = f"No response received after {self.retries} retries, continue with next request"
-            Log.error(txt)
-            raise self._io_exception_from_request(txt, request)
+                self.count_until_disconnect = self.max_until_disconnect
+                if request.dev_id and response.dev_id != request.dev_id:
+                    raise self._io_exception_from_request(
+                        f"ERROR: request uses device id={request.dev_id} but received {response.dev_id}.",
+                        request,
+                    )
+                if (
+                    response.transaction_id
+                    and response.transaction_id != request.transaction_id
+                ):
+                    raise self._io_exception_from_request(
+                        f"ERROR: request uses transaction id={request.transaction_id} but received {response.transaction_id}.",
+                        request,
+                    )
+                response.retries = count_retries
+                return response
+            except asyncio.exceptions.TimeoutError:
+                count_retries += 1
+        if self.count_until_disconnect < 0:
+            if self.comm_params.comm_type != CommType.SERIAL:
+                self.connection_lost(asyncio.TimeoutError("Server not responding"))
+            raise self._io_exception_from_request(
+                "ERROR: No response received of the last requests (default: retries+3), CLOSING CONNECTION.",
+                request,
+            )
+        self.count_until_disconnect -= 1
+        txt = f"No response received after {self.retries} retries, continue with next request"
+        Log.error(txt)
+        raise self._io_exception_from_request(txt, request)
 
     def pdu_send(self, pdu: ModbusPDU, addr: tuple | None = None) -> None:
         """Build byte stream and send."""

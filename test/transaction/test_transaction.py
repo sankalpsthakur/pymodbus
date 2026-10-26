@@ -11,6 +11,10 @@ from pymodbus.exceptions import ConnectionException, ModbusIOException
 from pymodbus.framer import FramerRTU, FramerSocket, FramerType
 from pymodbus.pdu import DecodePDU, ExceptionResponse
 from pymodbus.pdu.bit_message import ReadCoilsRequest, ReadCoilsResponse
+from pymodbus.pdu.register_message import (
+    ReadHoldingRegistersRequest,
+    ReadHoldingRegistersResponse,
+)
 from pymodbus.transaction import TransactionManager
 from pymodbus.transport import CommType
 
@@ -293,6 +297,83 @@ class TestTransaction:
             assert exc_info.value.fcode == request.function_code + 0x80
             assert exc_info.value.dev_id == request.dev_id
             assert exc_info.value.transaction_id == request.transaction_id
+
+    async def test_execute_cancel_does_not_return_stale_registers(self, use_clc):
+        """Cancelled execute must not deliver its response to the next request (#3070)."""
+        transact = TransactionManager(
+            use_clc,
+            FramerRTU(DecodePDU(False)),
+            0,
+            False,
+            None,
+            None,
+            None,
+        )
+        transact.send = mock.Mock()  # type: ignore[method-assign]
+        transact.retries = 0
+        transact.connection_made(mock.AsyncMock())
+        transact.transport.write = mock.Mock()  # type: ignore[method-assign, attr-defined]
+        transact.comm_params.timeout_connect = 0.3
+
+        stale_req = ReadHoldingRegistersRequest(address=0x3014, count=4, dev_id=1)
+        next_req = ReadHoldingRegistersRequest(address=0x3014, count=5, dev_id=1)
+        stale_pdu = ReadHoldingRegistersResponse(
+            registers=[6666, 6671, 5426, 1], dev_id=1
+        )
+        next_pdu = ReadHoldingRegistersResponse(
+            registers=[6666, 6671, 5426, 1, 21845], dev_id=1
+        )
+        stale_frame = transact.framer.buildFrame(stale_pdu)
+        next_frame = transact.framer.buildFrame(next_pdu)
+
+        first = asyncio.create_task(transact.execute(False, stale_req))
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(transact.execute(False, next_req))
+        await asyncio.sleep(0)
+        transact.data_received(stale_frame)
+        await asyncio.sleep(0)
+        transact.data_received(next_frame)
+        result = await second
+        assert result.registers == next_pdu.registers
+        assert result.registers != stale_pdu.registers
+
+    async def test_execute_cancel_timeout_still_serves_next_request(self, use_clc):
+        """A cancelled request whose response never arrives must not block later calls."""
+        transact = TransactionManager(
+            use_clc,
+            FramerRTU(DecodePDU(False)),
+            0,
+            False,
+            None,
+            None,
+            None,
+        )
+        transact.send = mock.Mock()  # type: ignore[method-assign]
+        transact.retries = 0
+        transact.connection_made(mock.AsyncMock())
+        transact.transport.write = mock.Mock()  # type: ignore[method-assign, attr-defined]
+        transact.comm_params.timeout_connect = 0.05
+
+        stale_req = ReadHoldingRegistersRequest(address=0x3014, count=4, dev_id=1)
+        next_req = ReadHoldingRegistersRequest(address=0x3014, count=5, dev_id=1)
+        next_pdu = ReadHoldingRegistersResponse(registers=[1, 2, 3, 4, 5], dev_id=1)
+        next_frame = transact.framer.buildFrame(next_pdu)
+
+        first = asyncio.create_task(transact.execute(False, stale_req))
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        second = asyncio.create_task(transact.execute(False, next_req))
+        await asyncio.sleep(0.08)
+        transact.data_received(next_frame)
+        result = await second
+        assert result.registers == next_pdu.registers
 
     async def test_transaction_receiver(self, use_clc):
         """Test tracers in disconnect."""
