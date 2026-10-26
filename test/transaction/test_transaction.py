@@ -300,12 +300,12 @@ class TestTransaction:
 
     async def _await_true(self, predicate, timeout=0.5) -> None:
         """Yield until predicate is true or timeout."""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while not predicate():
-            if loop.time() >= deadline:
-                raise TimeoutError
-            await asyncio.sleep(0)
+
+        async def _spin():
+            while not predicate():
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_spin(), timeout=timeout)
 
     async def test_execute_cancel_does_not_return_stale_registers(self, use_clc):
         """Cancelled execute must not deliver its response to the next request (#3070)."""
